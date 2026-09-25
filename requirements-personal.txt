@@ -1,0 +1,2 @@
+# Extra packages for the personal scripts (run_watchlist.py --alpaca).
+alpaca-py>=0.44

@@ -148,6 +148,12 @@ Everything is stored under `~/.tradingagents/` by default:
 
 User-supplied values used as path segments (tickers, run IDs) must go through `dataflows.symbols.safe_ticker_component`.
 
+## Personal additions (this fork only, not in upstream)
+
+- `run_watchlist.py` runs the graph over `watchlist.txt` for the last completed US session (New York time). With `--alpaca` it passes the Alpaca paper account to the agents as portfolio context and plans orders; `--execute` submits them.
+- `alpaca_bridge.py` holds the sizing rule and the order submission. It is paper-only (`paper=True`), long-only and cash-capped. Each order's `client_order_id` is `ta-<date>-<ticker>`, so re-running a date cannot place a duplicate.
+- `alpaca-py` is in `requirements-personal.txt`, not `pyproject.toml`. Don't edit upstream's files for personal features: new files merge cleanly with `git pull upstream main`, while edits to upstream files conflict.
+
 ## Conventions
 
 - Comments explain *why* and cite the GitHub issue that motivated the code (e.g. `(#1249)`). Follow that style when fixing a reported bug.

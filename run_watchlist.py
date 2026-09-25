@@ -4,15 +4,23 @@
     python run_watchlist.py --tickers NVDA,AAPL      # a subset
     python run_watchlist.py --date 2026-09-24        # a specific session
     python run_watchlist.py --analysts market,news   # fewer analysts, fewer LLM calls
+    python run_watchlist.py --alpaca                 # also plan orders on the Alpaca paper account
+    python run_watchlist.py --alpaca --execute       # and submit them
 
 Each ticker is a full multi-agent run. A ticker already in the decision log for
 the date is skipped, so an interrupted sweep continues where it stopped when run
 again. Stocks only: crypto needs a different analyst set.
+
+With --alpaca the agents see the paper account's cash and positions, and the
+ratings become orders by the sizing rule in alpaca_bridge.py. Without --execute
+the orders are only listed.
 """
 
 import argparse
 import csv
+import dataclasses
 import logging
+import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -79,7 +87,11 @@ def main():
     )
     parser.add_argument("--tickers", help="comma-separated tickers to run instead of watchlist.txt")
     parser.add_argument("--analysts", default=ANALYSTS, help=f"comma-separated (default: {ANALYSTS})")
+    parser.add_argument("--alpaca", action="store_true", help="plan orders on the Alpaca paper account")
+    parser.add_argument("--execute", action="store_true", help="submit the planned orders (needs --alpaca)")
     args = parser.parse_args()
+    if args.execute and not args.alpaca:
+        parser.error("--execute needs --alpaca")
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
@@ -90,6 +102,18 @@ def main():
         else read_watchlist(WATCHLIST)
     )
     analysts = [a.strip() for a in args.analysts.split(",") if a.strip()]
+
+    # Connect before the long run, so bad keys fail in seconds, not hours.
+    broker = portfolio = None
+    if args.alpaca:
+        import alpaca_bridge
+
+        try:
+            broker = alpaca_bridge.Broker()
+        except alpaca_bridge.BrokerError as exc:
+            sys.exit(f"Alpaca: {exc}")
+        portfolio = broker.portfolio_context()
+        print(broker.summary(), flush=True)
 
     config = DEFAULT_CONFIG.copy()
     ta = TradingAgentsGraph(analysts, config=config)
@@ -104,7 +128,7 @@ def main():
             continue
         print(f"[{i}/{len(tickers)}] {ticker} ...", flush=True)
         try:
-            final_state, rating = ta.propagate(ticker, trade_date)
+            final_state, rating = ta.propagate(ticker, trade_date, portfolio=portfolio)
             report_dir = ta.save_reports(final_state, ticker)
             results.append((ticker, rating, str(report_dir)))
             print(f"[{i}/{len(tickers)}] {ticker}: {rating}", flush=True)
@@ -128,6 +152,22 @@ def main():
     for ticker, rating, _ in results:
         print(f"  {ticker:10} {rating}")
     print(f"\nSummary: {summary}")
+
+    if broker is not None:
+        broker.refresh()
+        # Slots come from the whole watchlist, so a --tickers subset is not sized larger.
+        slots = max(len(read_watchlist(WATCHLIST)), len(tickers))
+        plans = broker.plan([(ticker, rating) for ticker, rating, _ in results], slots)
+        if args.execute:
+            broker.submit(plans, trade_date)
+        orders = out_dir / f"{trade_date}-orders.csv"
+        with open(orders, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[fl.name for fl in dataclasses.fields(alpaca_bridge.Plan)])
+            writer.writeheader()
+            writer.writerows(dataclasses.asdict(p) for p in plans)
+        mode = "submitted" if args.execute else "dry run: add --execute to submit"
+        print(f"\nOrders ({mode}):\n{alpaca_bridge.render(plans)}")
+        print(f"\nOrders: {orders}")
 
 
 if __name__ == "__main__":
