@@ -14,9 +14,10 @@ Sizing (long-only; never shorts, never borrows):
     Sell         close the position
     anything else (REVIEW, ERROR): no trade
 
-Buys together spend at most the cash free when the plan is made. Proceeds of
-sells in the same run are not counted, so margin is never used. Market orders
-placed after the 16:00 ET close queue for the next session.
+Buys together spend at most the cash free when the plan is made, and at most
+MAX_DAILY_BUY of equity in one run, so a new book is built over several days.
+Proceeds of sells in the same run are not counted, so margin is never used.
+Market orders placed after the 16:00 ET close queue for the next session.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
@@ -31,7 +34,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, PositionSide, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+from alpaca.trading.requests import GetCalendarRequest, GetOrdersRequest, MarketOrderRequest
 
 from tradingagents.portfolio import PortfolioContext, Position
 
@@ -47,6 +50,12 @@ TARGETS = {
 # A change smaller than this share of a slot is not worth an order.
 REBALANCE_BAND = 0.05
 MIN_ORDER = 1.0  # dollars; Alpaca's smallest notional order
+# Share of equity that one run may spend on buys.
+MAX_DAILY_BUY = 0.25
+
+MARKET_TZ = ZoneInfo("America/New_York")  # Alpaca's calendar times are New York times
+# Yahoo's daily bar is final a little after the close; before that its Close is partial.
+BAR_FINAL_AFTER = timedelta(minutes=30)
 
 
 class BrokerError(RuntimeError):
@@ -101,8 +110,24 @@ class Broker:
 
     def summary(self) -> str:
         a = self.account
-        return (f"Alpaca paper {a.account_number}: equity ${float(a.equity):,.2f}, "
-                f"cash ${float(a.cash):,.2f}, {len(self.positions)} positions")
+        change = float(a.equity) - float(a.last_equity)
+        return (f"Alpaca paper {a.account_number}: equity ${float(a.equity):,.2f} "
+                f"({change:+,.2f} today), cash ${float(a.cash):,.2f}, {len(self.positions)} positions")
+
+    def last_completed_session(self, now: datetime | None = None) -> str:
+        """The latest session whose daily bar is final, from Alpaca's market calendar.
+
+        Holidays are skipped and early closes honoured, so a run on a holiday or a
+        weekend lands on a session already analyzed and places nothing new.
+        """
+        now = (now or datetime.now(MARKET_TZ)).astimezone(MARKET_TZ).replace(tzinfo=None)
+        sessions = self.trading.get_calendar(
+            GetCalendarRequest(start=now.date() - timedelta(days=14), end=now.date())
+        )
+        done = [s for s in sessions if s.close + BAR_FINAL_AFTER <= now]
+        if not done:
+            raise BrokerError("no completed session in the last two weeks of Alpaca's calendar")
+        return done[-1].date.strftime("%Y-%m-%d")
 
     def portfolio_context(self) -> PortfolioContext:
         """The book as the trader, risk and portfolio agents see it."""
@@ -116,14 +141,16 @@ class Broker:
         )
 
     def plan(self, ratings: list[tuple[str, str]], slots: int) -> list[Plan]:
-        """One plan per (ticker, rating); buys are capped to the free cash."""
-        slot = float(self.account.equity) / max(slots, 1)
+        """One plan per (ticker, rating); buys are capped to the free cash and the daily cap."""
+        equity = float(self.account.equity)
+        slot = equity / max(slots, 1)
         band = max(MIN_ORDER, REBALANCE_BAND * slot)
         queued = {o.symbol for o in self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))}
         plans = [self._plan_one(ticker, rating, slot, band, queued) for ticker, rating in ratings]
 
         # Open orders already hold buying power, and cash alone never borrows.
-        budget = max(0.0, min(float(self.account.cash), float(self.account.non_marginable_buying_power)))
+        budget = max(0.0, min(float(self.account.cash), float(self.account.non_marginable_buying_power),
+                              MAX_DAILY_BUY * equity))
         for plan in sorted((p for p in plans if p.side == "buy"), key=lambda p: p.rating != "Buy"):
             budget -= self._size_buy(plan, budget, band)
         return plans
@@ -190,8 +217,10 @@ class Broker:
         wanted = plan.notional
         amount = min(wanted, budget)
         if amount < band:
-            plan.side, plan.notional, plan.note = "", None, "no cash left"
+            plan.side, plan.notional, plan.note = "", None, "today's buy budget is used up"
             return 0.0
+        if budget < wanted - band:
+            plan.note = "capped by today's buy budget"
         if self._asset(plan.ticker).fractionable:
             plan.notional = math.floor(amount * 100) / 100
         else:
@@ -201,8 +230,7 @@ class Broker:
                 plan.side, plan.notional, plan.note = "", None, f"one share (${price:,.2f}) exceeds the buy"
                 return 0.0
             plan.notional, plan.qty, amount = None, shares, shares * price
-        if amount < wanted - band:
-            plan.note = "capped by cash"
+            plan.note = plan.note or f"whole shares at ${price:,.2f}"
         return amount
 
     def _asset(self, ticker):

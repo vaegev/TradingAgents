@@ -151,7 +151,9 @@ User-supplied values used as path segments (tickers, run IDs) must go through `d
 ## Personal additions (this fork only, not in upstream)
 
 - `run_watchlist.py` runs the graph over `watchlist.txt` for the last completed US session (New York time). With `--alpaca` it passes the Alpaca paper account to the agents as portfolio context and plans orders; `--execute` submits them.
-- `alpaca_bridge.py` holds the sizing rule and the order submission. It is paper-only (`paper=True`), long-only and cash-capped. Each order's `client_order_id` is `ta-<date>-<ticker>`, so re-running a date cannot place a duplicate.
+- `alpaca_bridge.py` holds the sizing rule and the order submission. It is paper-only (`paper=True`), long-only and cash-capped, and one run may spend at most `MAX_DAILY_BUY` of equity. Each order's `client_order_id` is `ta-<date>-<ticker>`, so re-running a date cannot place a duplicate. With `--alpaca`, the analysis date comes from Alpaca's market calendar (holidays, early closes).
+- Unattended-run guards in `run_watchlist.py`: a lock file, the kill switch `~/.tradingagents/STOP` (it still plans but submits nothing), and an outage breaker (no orders when more than `MAX_ERROR_SHARE` of tickers fail).
+- `schedule.sh install|remove|status|run-now` manages the macOS launchd job: Tue–Sat 09:00 local time, `--alpaca --execute`, logging to `~/.tradingagents/logs/watchlist/daily.log`.
 - `alpaca-py` is in `requirements-personal.txt`, not `pyproject.toml`. Don't edit upstream's files for personal features: new files merge cleanly with `git pull upstream main`, while edits to upstream files conflict.
 
 ## Conventions

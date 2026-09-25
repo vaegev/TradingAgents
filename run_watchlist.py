@@ -11,26 +11,40 @@ Each ticker is a full multi-agent run. A ticker already in the decision log for
 the date is skipped, so an interrupted sweep continues where it stopped when run
 again. Stocks only: crypto needs a different analyst set.
 
-With --alpaca the agents see the paper account's cash and positions, and the
-ratings become orders by the sizing rule in alpaca_bridge.py. Without --execute
-the orders are only listed.
+With --alpaca the agents see the paper account's cash and positions, the date
+comes from Alpaca's market calendar, and the ratings become orders by the sizing
+rule in alpaca_bridge.py. Without --execute the orders are only listed.
+
+Guards for unattended runs:
+  - only one run at a time (a lock file);
+  - no orders while ~/.tradingagents/STOP exists (touch it to stop trading);
+  - no orders when more than MAX_ERROR_SHARE of the tickers failed, since a
+    provider outage leaves the rest resting on broken data.
 """
 
 import argparse
 import csv
 import dataclasses
+import fcntl
 import logging
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from cli.stats_handler import StatsCallbackHandler
 from tradingagents.agents.rating import RATINGS_5_TIER
+from tradingagents.backtest import summarize
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 WATCHLIST = Path(__file__).with_name("watchlist.txt")
 ANALYSTS = "market,social,news,fundamentals"
+
+HOME = Path.home() / ".tradingagents"
+KILL_SWITCH = HOME / "STOP"
+LOCK_FILE = HOME / "run_watchlist.lock"
+MAX_ERROR_SHARE = 0.2
 
 MARKET_TZ = ZoneInfo("America/New_York")
 # Yahoo publishes the final daily bar shortly after the 16:00 close. Before then
@@ -77,6 +91,17 @@ def read_watchlist(path: Path) -> list[str]:
     return tickers
 
 
+def acquire_lock():
+    """Hold an exclusive lock for the life of the process, or exit if a run holds it."""
+    HOME.mkdir(parents=True, exist_ok=True)
+    handle = open(LOCK_FILE, "w")  # noqa: SIM115 -- closing the file would release the lock
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("another run_watchlist.py is running; not starting a second one")
+    return handle
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -94,8 +119,9 @@ def main():
         parser.error("--execute needs --alpaca")
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    lock = acquire_lock()  # noqa: F841 -- held until the process exits
+    print(f"=== run started {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
 
-    trade_date = args.date or last_completed_session()
     tickers = (
         [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
         if args.tickers
@@ -114,9 +140,11 @@ def main():
             sys.exit(f"Alpaca: {exc}")
         portfolio = broker.portfolio_context()
         print(broker.summary(), flush=True)
+    trade_date = args.date or (broker.last_completed_session() if broker else last_completed_session())
 
     config = DEFAULT_CONFIG.copy()
-    ta = TradingAgentsGraph(analysts, config=config)
+    stats = StatsCallbackHandler()
+    ta = TradingAgentsGraph(analysts, config=config, callbacks=[stats])
     logged = {(e["ticker"], e["date"]): e["rating"] for e in ta.memory_log.load_entries()}
 
     print(f"Analyzing {len(tickers)} tickers for {trade_date} with {', '.join(analysts)}", flush=True)
@@ -127,14 +155,18 @@ def main():
             results.append((ticker, logged[ticker, trade_date], "from decision log"))
             continue
         print(f"[{i}/{len(tickers)}] {ticker} ...", flush=True)
+        before = stats.get_stats()
         try:
             final_state, rating = ta.propagate(ticker, trade_date, portfolio=portfolio)
             report_dir = ta.save_reports(final_state, ticker)
             results.append((ticker, rating, str(report_dir)))
-            print(f"[{i}/{len(tickers)}] {ticker}: {rating}", flush=True)
+            outcome = rating
         except Exception as exc:  # one failing ticker must not end the sweep
             results.append((ticker, "ERROR", str(exc)))
-            print(f"[{i}/{len(tickers)}] {ticker}: failed: {exc}", flush=True)
+            outcome = f"failed: {exc}"
+        used = {k: v - before[k] for k, v in stats.get_stats().items()}
+        print(f"[{i}/{len(tickers)}] {ticker}: {outcome}  ({used['llm_calls']} LLM calls, "
+              f"{used['tokens_in']:,} in / {used['tokens_out']:,} out tokens)", flush=True)
 
     # Most bullish first; REVIEW and ERROR last.
     order = {r: n for n, r in enumerate(RATINGS_5_TIER)}
@@ -151,23 +183,44 @@ def main():
     print(f"\nRatings for {trade_date}:")
     for ticker, rating, _ in results:
         print(f"  {ticker:10} {rating}")
-    print(f"\nSummary: {summary}")
+    total = stats.get_stats()
+    print(f"\nLLM usage: {total['llm_calls']} calls, {total['tokens_in']:,} input / "
+          f"{total['tokens_out']:,} output tokens")
+    print(f"Summary: {summary}")
 
     if broker is not None:
         broker.refresh()
         # Slots come from the whole watchlist, so a --tickers subset is not sized larger.
         slots = max(len(read_watchlist(WATCHLIST)), len(tickers))
         plans = broker.plan([(ticker, rating) for ticker, rating, _ in results], slots)
-        if args.execute:
+
+        errors = sum(rating == "ERROR" for _, rating, _ in results)
+        blocked = None
+        if KILL_SWITCH.exists():
+            blocked = f"kill switch {KILL_SWITCH} is present"
+        elif errors > MAX_ERROR_SHARE * len(results):
+            blocked = f"{errors} of {len(results)} tickers failed, so the ratings may rest on broken data"
+        if args.execute and blocked is None:
             broker.submit(plans, trade_date)
+            mode = "submitted"
+        elif args.execute:
+            mode = f"NOT submitted: {blocked}"
+        else:
+            mode = "dry run: add --execute to submit"
+
         orders = out_dir / f"{trade_date}-orders.csv"
         with open(orders, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=[fl.name for fl in dataclasses.fields(alpaca_bridge.Plan)])
             writer.writeheader()
             writer.writerows(dataclasses.asdict(p) for p in plans)
-        mode = "submitted" if args.execute else "dry run: add --execute to submit"
         print(f"\nOrders ({mode}):\n{alpaca_bridge.render(plans)}")
-        print(f"\nOrders: {orders}")
+        print(f"Orders: {orders}")
+        print(f"\n{broker.summary()}")
+
+    log_path = Path(config["memory_log_path"])
+    if log_path.is_file():
+        print(f"\nScorecard, all settled decisions:\n{summarize(log_path).render()}")
+    print(f"=== run finished {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
 
 
 if __name__ == "__main__":
