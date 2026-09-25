@@ -240,7 +240,7 @@ from tradingagents.default_config import DEFAULT_CONFIG
 ta = TradingAgentsGraph(debug=True, config=DEFAULT_CONFIG.copy())
 
 # forward propagate
-_, decision = ta.propagate("NVDA", "2026-09-01")
+_, decision = ta.propagate("AMD", "2026-09-01")
 print(decision)
 ```
 
@@ -257,7 +257,7 @@ config["quick_think_llm"] = "gpt-6-luna"   # Model for quick tasks
 config["max_debate_rounds"] = 2
 
 ta = TradingAgentsGraph(debug=True, config=config)
-_, decision = ta.propagate("NVDA", "2026-09-01")
+_, decision = ta.propagate("AMD", "2026-09-01")
 print(decision)
 ```
 
@@ -291,9 +291,9 @@ from tradingagents.portfolio import PortfolioContext
 portfolio = PortfolioContext.model_validate({
     "cash": 25000.0,
     "currency": "USD",
-    "positions": [{"ticker": "NVDA", "quantity": 120, "average_price": 150.0}],
+    "positions": [{"ticker": "AMD", "quantity": 120, "average_price": 150.0}],
 })
-_, decision = ta.propagate("NVDA", "2026-09-01", portfolio=portfolio)
+_, decision = ta.propagate("AMD", "2026-09-01", portfolio=portfolio)
 ```
 
 The CLI takes the same content as a JSON file: `tradingagents --portfolio my_book.json`.
@@ -325,7 +325,7 @@ tradingagents --clear-checkpoints    # reset before running
 config = DEFAULT_CONFIG.copy()
 config["checkpoint_enabled"] = True
 ta = TradingAgentsGraph(config=config)
-_, decision = ta.propagate("NVDA", "2026-09-01")
+_, decision = ta.propagate("AMD", "2026-09-01")
 ```
 
 ## Evaluating decisions over time
@@ -336,14 +336,14 @@ One run gives one decision, which cannot tell you whether the system decides wel
 from tradingagents.backtest import iter_grid, run_backtest, summarize
 
 dates = iter_grid("2026-06-01", "2026-08-01", every_n_days=7)
-result = run_backtest(["NVDA", "AAPL"], dates, config, selected_analysts=["market", "news"])
+result = run_backtest(["AMD", "AAPL"], dates, config, selected_analysts=["market", "news"])
 print(summarize(result).render())
 ```
 
 From the CLI:
 
 ```bash
-tradingagents backtest NVDA,AAPL --start 2026-06-01 --end 2026-08-01 --every 7
+tradingagents backtest AMD,AAPL --start 2026-06-01 --end 2026-08-01 --every 7
 ```
 
 Each cell is scored on realized alpha against the instrument's regional benchmark, grouped by rating. Your own decision log is never written to, and re-running the same grid with `run_id=result.run_id` skips the cells that already ran, so an interrupted sweep continues where it stopped.

@@ -80,7 +80,7 @@ def analyze(
 
 @app.command()
 def backtest(
-    tickers: str = typer.Argument(..., help="Comma-separated tickers, e.g. NVDA,AAPL"),
+    tickers: str = typer.Argument(..., help="Comma-separated tickers, e.g. AMD,AAPL"),
     start: str = typer.Option(..., "--start", help="First analysis date, YYYY-MM-DD"),
     end: str = typer.Option(..., "--end", help="Last analysis date, YYYY-MM-DD"),
     every: int = typer.Option(7, "--every", help="Days between analysis dates"),
@@ -106,7 +106,7 @@ def backtest(
 
     names = [t.strip() for t in tickers.split(",") if t.strip()]
     if not names:
-        console.print("[red]No ticker to analyze; pass them comma-separated, e.g. NVDA,AAPL[/red]")
+        console.print("[red]No ticker to analyze; pass them comma-separated, e.g. AMD,AAPL[/red]")
         raise typer.Exit(code=1)
 
     kwargs = {"asset_type": asset_type, "portfolio": book, "run_id": run_id}
